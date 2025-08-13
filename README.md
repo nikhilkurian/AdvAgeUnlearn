@@ -1,110 +1,71 @@
-# Medical Image Classification with Adversarial Training
+# Medical Image Classification – Minimal Run Guide
 
-A PyTorch Lightning-based framework for medical image classification with adversarial training to reduce demographic bias. This project implements multiple deep learning architectures for chest X-ray analysis using the MIMIC-CXR dataset.
+This repository contains a PyTorch Lightning pipeline to train and evaluate multilabel chest X-ray classifiers (14 classes). This document includes only what you need to install, configure, and run.
 
-## 🏥 Project Overview
+## 1) Requirements
 
-This repository contains a robust medical image classification system designed to:
-- Classify 14 different medical conditions from chest X-rays
-- Reduce demographic bias through adversarial training
-- Support multiple deep learning architectures
-- Provide comprehensive evaluation metrics and embeddings extraction
-
-## 🚀 Features
-
-### Models Supported
-- **DenseNetAgeAdv**: DenseNet-121 with adversarial age group training
-- **DenseNet**: Standard DenseNet-121 for medical image classification
-- **ResNet**: ResNet-34 architecture
-- **VisionTransformer**: Vision Transformer (ViT) architecture
-
-### Key Features
-- ✅ **Adversarial Training**: Age group adversarial training to reduce demographic bias
-- ✅ **Multi-label Classification**: 14 medical conditions classification
-- ✅ **Age Group Analysis**: Automatic age group categorization and analysis
-- ✅ **Comprehensive Logging**: TensorBoard integration for training monitoring
-- ✅ **Checkpoint Management**: Automatic checkpointing and recovery
-- ✅ **Embeddings Extraction**: Feature vector extraction for downstream analysis
-- ✅ **AUC Evaluation**: Per-class and macro AUC calculation
-- ✅ **Data Augmentation**: Configurable image augmentation pipeline
-
-## 📋 Requirements
-
-### System Requirements
 - Python 3.8+
-- CUDA-compatible GPU (recommended)
-- 16GB+ RAM (for large datasets)
+- CUDA-capable GPU recommended
+- Install Python packages:
 
-### Python Dependencies
-```bash
-torch>=1.12.0
-torchvision>=0.13.0
-pytorch-lightning>=1.8.0
-timm>=0.6.0
-pandas>=1.4.0
-numpy>=1.21.0
-scikit-learn>=1.1.0
-scikit-image>=0.19.0
-Pillow>=9.0.0
-PyYAML>=6.0
-tqdm>=4.64.0
-```
-
-## 🛠️ Installation
-
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/medical-image-classification.git
-cd medical-image-classification
-```
-
-2. **Create a virtual environment**
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. **Install dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-## 📁 Project Structure
+## 2) Data Expectations
 
-```
-AdvRem/
-├── config.yaml              # Configuration file
-├── dataset.py               # Data loading and preprocessing
-├── model.py                 # Model architectures
-├── train.py                 # Training script
-├── README.md               # This file
-├── outputs/                # Training outputs
-├── checkpoints/            # Model checkpoints
-├── logs/                   # TensorBoard logs
-└── learning-not-to-learn/  # Additional learning methods
-```
+You need two kinds of CSV files:
 
-## ⚙️ Configuration
+1) Dataset CSVs (for train/val/test), e.g. `train_mimic.csv`:
+- Must include column `path_preproc` (relative path to preprocessed image)
+- Must include 14 label columns with 0/1 values:
+  - No Finding, Enlarged Cardiomediastinum, Cardiomegaly, Lung Opacity, Lung Lesion, Edema, Consolidation, Pneumonia, Atelectasis, Pneumothorax, Pleural Effusion, Pleural Other, Fracture, Support Devices
+- Optional columns: `age` or `AgeGroup` (if `age` exists, age groups can be inferred)
 
-Edit `config.yaml` to customize your training setup:
+2) Metadata CSVs (for train/val/test), e.g. `train_final.csv`:
+- Must include column `img_path` (absolute path to the image)
+- Can include any additional columns (StudyDate, Age, Sex, View, etc.) for merging into outputs
+
+Note on paths: if the dataset images and metadata `img_path` use different root prefixes, the training script remaps dataset paths to match metadata before merging predictions/embeddings.
+
+## 3) Configure
+
+All settings are in `config.yaml`. Update the paths and essential parameters.
+
+Minimal set of keys to edit:
 
 ```yaml
-# Model Settings
-model_type: 'DenseNetAgeAdv'  # Options: 'DenseNet', 'ResNet', 'VisionTransformer', 'DenseNetAgeAdv'
-num_classes_main: 14
-adv_age_lambda: 0.1  # Adversarial training weight
+# Outputs
+out_name_prefix: 'experiment'
+out_base_dir: './outputs'
+log_dir: './logs'
+checkpoint_dir: './checkpoints'
 
-# Data Settings
+# Data paths (edit all)
+train_csv: '/absolute/path/to/train_mimic.csv'
+val_csv: '/absolute/path/to/val_mimic.csv'
+test_csv: '/absolute/path/to/test_mimic.csv'
+train_details_csv: '/absolute/path/to/train_final.csv'
+val_details_csv: '/absolute/path/to/val_final.csv'
+test_details_csv: '/absolute/path/to/test_final.csv'
+img_data_dir: '/absolute/path/to/images_root/'
+
+# Model (choose one model_type)
+model_type: 'DenseNetAgeAdv'   # Options: DenseNet, ResNet, VisionTransformer, DenseNetAgeAdv
+num_classes_main: 14
+adv_age_lambda: 0.1            # used only by DenseNetAgeAdv
+
+# Data loading
 image_size: [224, 224]
 batch_size_main: 150
 num_workers: 4
 
-# Training Settings
-epochs_main: 50
+# Training
+epochs_main: 1                 # increase for real runs
 enable_early_stopping: True
 early_stopping_patience: 10
 
-# Age Groups Configuration
+# Age groups (used for metadata-aware training/eval)
 age_groups:
   - [0, 36, "0-36"]
   - [36, 50, "36-50"]
@@ -112,170 +73,44 @@ age_groups:
   - [65, -1, "65+"]
 ```
 
-## 🏃‍♂️ Usage
+## 4) Run
 
-### 1. Prepare Your Data
-
-Ensure your data follows this structure:
-```
-data/
-├── train_mimic.csv          # Training data CSV
-├── val_mimic.csv            # Validation data CSV
-├── test_mimic.csv           # Test data CSV
-├── train_final.csv          # Training metadata
-├── val_final.csv            # Validation metadata
-├── test_final.csv           # Test metadata
-└── images/                  # Image files
-```
-
-### 2. Update Configuration
-
-Modify `config.yaml` with your data paths:
-```yaml
-train_csv: '/path/to/your/train_mimic.csv'
-val_csv: '/path/to/your/val_mimic.csv'
-test_csv: '/path/to/your/test_mimic.csv'
-train_details_csv: '/path/to/your/train_final.csv'
-val_details_csv: '/path/to/your/val_final.csv'
-test_details_csv: '/path/to/your/test_final.csv'
-img_data_dir: '/path/to/your/images/'
-```
-
-### 3. Start Training
+Train + validate (and test + export predictions/embeddings after training):
 
 ```bash
-# Basic training
 python train.py --config config.yaml --dev 0
-
-# Resume from checkpoint
-python train.py --config config.yaml --checkpoint_path path/to/checkpoint.ckpt --dev 0
 ```
 
-### 4. Monitor Training
+Resume from a checkpoint:
 
 ```bash
-# Start TensorBoard
+python train.py --config config.yaml --checkpoint_path /path/to/checkpoint.ckpt --dev 0
+```
+
+Monitor with TensorBoard:
+
+```bash
 tensorboard --logdir logs/
 ```
 
-## 📊 Medical Conditions
+## 5) Outputs
 
-The model classifies 14 medical conditions:
-1. No Finding
-2. Enlarged Cardiomediastinum
-3. Cardiomegaly
-4. Lung Opacity
-5. Lung Lesion
-6. Edema
-7. Consolidation
-8. Pneumonia
-9. Atelectasis
-10. Pneumothorax
-11. Pleural Effusion
-12. Pleural Other
-13. Fracture
-14. Support Devices
+For each run, files are written under the output directory specified in `config.yaml`:
 
-## 📈 Outputs
+- predictions.train.epoch_X.csv
+- predictions.val.model_<id>.csv
+- predictions.test.model_<id>.csv
+- embeddings.train.epoch_X.csv
+- embeddings.val.model_<id>.csv
+- embeddings.test.model_<id>.csv
+- per_class_auc.txt (per-class and macro AUC)
+- checkpoints directory with best/last checkpoints
 
-### Training Outputs
-- **Predictions**: CSV files with model predictions, logits, and targets
-- **Embeddings**: 1024-dimensional feature vectors for each image
-- **Metrics**: Per-class AUC scores and macro AUC
-- **Checkpoints**: Model checkpoints for recovery and inference
+Each predictions CSV contains: per-class probabilities, logits, targets, `img_path`, and merged metadata. Each embeddings CSV contains a feature vector per image plus targets and metadata.
 
-### File Structure
-```
-outputs/experiment_name/
-├── predictions.train.epoch_X.csv
-├── predictions.val.model_X.csv
-├── predictions.test.model_X.csv
-├── embeddings.train.epoch_X.csv
-├── embeddings.val.model_X.csv
-├── embeddings.test.model_X.csv
-└── per_class_auc.txt
-```
+## 6) Common Issues
 
-## 🔬 Adversarial Training
-
-The `DenseNetAgeAdv` model implements adversarial training to reduce demographic bias:
-
-- **Main Task**: Medical condition classification
-- **Adversarial Task**: Age group prediction with gradient reversal
-- **Loss Function**: `Total Loss = Classification Loss + λ × Adversarial Loss`
-
-This approach helps the model learn features that are invariant to age-related demographic factors.
-
-## 🧪 Experiments
-
-### Supported Model Architectures
-
-1. **DenseNetAgeAdv** (Recommended)
-   - DenseNet-121 backbone
-   - Adversarial age group training
-   - Best for reducing demographic bias
-
-2. **DenseNet**
-   - Standard DenseNet-121
-   - Good baseline performance
-
-3. **ResNet**
-   - ResNet-34 architecture
-   - Faster training, good performance
-
-4. **VisionTransformer**
-   - Vision Transformer (ViT)
-   - State-of-the-art attention-based model
-
-## 📝 Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@article{medical_image_classification_2024,
-  title={Medical Image Classification with Adversarial Training for Demographic Bias Reduction},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2024}
-}
-```
-
-## 🤝 Contributing
-
-We welcome contributions! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-### Contributing Guidelines
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🆘 Support
-
-If you encounter any issues or have questions:
-
-1. Check the [Issues](https://github.com/yourusername/medical-image-classification/issues) page
-2. Create a new issue with detailed information
-3. Include your configuration and error messages
-
-## 🙏 Acknowledgments
-
-- MIMIC-CXR dataset for providing the medical imaging data
-- PyTorch Lightning for the training framework
-- The medical imaging research community
-
-## 📊 Performance
-
-Typical performance metrics on MIMIC-CXR test set:
-- **Macro AUC**: ~0.76-0.80
-- **Best performing class**: Pleural Effusion (AUC: ~0.89)
-- **Training time**: ~2-4 hours on RTX 4090
-
----
-
-**Note**: This is a research implementation. For clinical use, additional validation and regulatory approval may be required. 
+- Empty CSVs after run: ensure `img_path` in metadata matches dataset image paths (root prefixes must align). The script remaps common roots, but custom setups may require adjusting paths or metadata.
+- CUDA out of memory: reduce `batch_size_main` or `image_size`.
+- Slow loading: increase `num_workers`.
+- File not found: verify all paths in `config.yaml` are absolute and readable. 
