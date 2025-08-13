@@ -1,4 +1,4 @@
-# Medical Image Classification – Minimal Run Guide
+# Adverserial Unlearning of Age Features
 
 This repository contains a PyTorch Lightning pipeline to train and evaluate multilabel chest X-ray classifiers (14 classes). This document includes only what you need to install, configure, and run.
 
