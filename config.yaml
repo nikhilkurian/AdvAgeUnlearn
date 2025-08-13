@@ -1,0 +1,50 @@
+# Training Configuration for Medical Image Classification
+
+# Output and Logging Settings
+out_name_prefix: 'mimic_mdn_experiment'
+out_base_dir: './outputs'
+log_dir: './logs'
+checkpoint_dir: './checkpoints'
+
+# Data Paths - UPDATE THESE WITH YOUR ACTUAL PATHS
+train_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/train_mimic.csv'
+val_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/val_mimic.csv'
+test_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/test_mimic.csv'
+train_details_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/train_final.csv'
+val_details_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/val_final.csv'
+test_details_csv: '/home/4tb/mimic/files/mimic-cxr-jpg/data_csv/csv/test_final.csv'
+img_data_dir: '/home/4tb/mimic/files/mimic-cxr-jpg/2.1.0/files/'
+
+# Model Settings
+model_type: 'DenseNetAgeAdv' # Options: 'DenseNet', 'ResNet', 'VisionTransformer','DenseNetAgeAdv'
+num_classes_main: 14
+adv_age_lambda: 0.1 # (optional – only if you want to pass via hparams; otherwise keep default)
+
+image_size: [224, 224]
+
+# Training Settings
+batch_size_main: 150  # Adjust based on your GPU memory
+num_workers: 4  # Adjust based on your CPU cores
+epochs_main: 50  # Total training epochs
+
+# Checkpoint Settings
+save_all_checkpoints: False  # Set to True to save all checkpoints
+checkpoint_save_top_k: 3  # Keep top 3 checkpoints
+checkpoint_save_every_n_steps: 100  # Save every 100 steps
+checkpoint_cleanup_keep_last: 3  # Keep last 3 checkpoints during cleanup
+
+# Early Stopping
+enable_early_stopping: True
+early_stopping_patience: 10  # Stop if no improvement for 10 epochs
+
+# Age Groups Configuration
+# Format: [(min_age, max_age, group_name), ...]
+age_groups:
+  - [0, 36, "0-36"]
+  - [36, 50, "36-50"]
+  - [50, 65, "50-65"]
+  - [65, -1, "65+"]  # -1 represents infinity
+
+# Note: MDN (Mixture Density Network) settings are not currently implemented
+# in the model classes. If you need MDN functionality, you'll need to extend
+# the model classes in model.py to support metadata inputs and MDN outputs.
