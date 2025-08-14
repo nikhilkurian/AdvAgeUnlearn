@@ -8,6 +8,10 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 from argparse import ArgumentParser
 import yaml
+import csv
+import time
+import math
+from collections import defaultdict, deque
 
 # Import from our modular files
 from dataset import CheXpertDataModule
@@ -16,9 +20,227 @@ from model import (
     cleanup_old_checkpoints, calculate_aucs, make_identity_linear
 )
 
+# =============================================================================
+# COMPREHENSIVE LOGGING SYSTEM FOR ADVERSARIAL TRAINING
+# =============================================================================
+
+class EMA:
+    """Exponential Moving Average for smoothing metrics"""
+    def __init__(self, alpha=0.1):
+        self.alpha = alpha
+        self.state = {}
+    
+    def update(self, key, value):
+        if value is None: return None
+        v = float(value)
+        if key not in self.state: 
+            self.state[key] = v
+        else: 
+            self.state[key] = self.alpha * v + (1 - self.alpha) * self.state[key]
+        return self.state[key]
+    
+    def get(self, key, default=None): 
+        return self.state.get(key, default)
+
+def _ensure_dir(path):
+    if path and not os.path.exists(path): 
+        os.makedirs(path, exist_ok=True)
+
+def adversary_accuracy_from_logits(logits, targets, mode="categorical"):
+    """
+    Compute adversary accuracy from logits
+    logits: torch.Tensor (B,C) for categorical or (B,K-1) for ordinal (cumulative)
+    targets: torch.LongTensor age bin indices [0..C-1] or [0..K-1]
+    Returns a float accuracy (categorical) or negative MAE proxy (ordinal).
+    """
+    import torch.nn.functional as F
+    if mode == "categorical":
+        preds = logits.argmax(dim=1)
+        return (preds == targets).float().mean().item()
+    else:
+        # For ordinal, convert cumulative logits to bin by counting thresholds passed
+        probs_gt = torch.sigmoid(logits)  # P(y > k)
+        # Predict bin as number of thresholds where prob>0.5
+        pred_bins = (probs_gt > 0.5).sum(dim=1)
+        mae = (pred_bins.to(torch.float32) - targets.to(torch.float32)).abs().mean().item()
+        # Return "accuracy-like" score: higher is better => 1 - normalized MAE
+        K_minus_1 = logits.shape[1]
+        return max(0.0, 1.0 - mae / max(1, K_minus_1))
+
+class AdvLogger:
+    """
+    Comprehensive logging system for adversarial training
+    Tracks and logs:
+      - main_loss, age_loss, total_loss
+      - lambda (GRL strength)
+      - adv_acc (age head accuracy or MAE depending on mode)
+      - main_auc_macro, main_auc_micro
+      - per_label_auc (list)
+      - probe_age_auc (frozen-probe leakage)
+      - (optional) ece_macro
+    Writes to TensorBoard + CSV.
+    """
+    def __init__(self, log_dir="logs/adv", csv_name="train_log.csv", per_label_names=None):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        self.run_dir = os.path.join(log_dir, ts)
+        _ensure_dir(self.run_dir)
+        self.csv_path = os.path.join(self.run_dir, csv_name)
+        self.tb = None  # Will be set by TensorBoardLogger
+        self.ema = EMA(alpha=0.1)
+        self.per_label_names = per_label_names or []
+        self._init_csv()
+
+        # rolling buffers (last N steps) for quick sanity checks
+        self.buffers = defaultdict(lambda: deque(maxlen=200))
+
+    def _init_csv(self):
+        self.csv_fields = [
+            "step","epoch",
+            "main_loss","age_loss","total_loss",
+            "lambda","adv_acc",
+            "main_auc_macro","main_auc_micro","probe_age_auc","ece_macro",
+        ]
+        # add dynamic per-label AUC fields if provided
+        for i, name in enumerate(self.per_label_names):
+            self.csv_fields.append(f"auc_{i}_{name}" if name else f"auc_{i}")
+        with open(self.csv_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=self.csv_fields).writeheader()
+
+    def set_tensorboard(self, tb_logger):
+        """Set TensorBoard logger for logging"""
+        self.tb = tb_logger.experiment if hasattr(tb_logger, 'experiment') else tb_logger
+
+    # --- helpers you can call per-step ---
+    def log_step(self, step, epoch, main_loss=None, age_loss=None, total_loss=None,
+                 lambd=None, adv_acc=None):
+        # Keep short-term buffers + EMAs
+        for k, v in [("main_loss", main_loss), ("age_loss", age_loss),
+                     ("total_loss", total_loss), ("lambda", lambd), ("adv_acc", adv_acc)]:
+            if v is not None:
+                self.buffers[k].append(float(v))
+                self.ema.update(k, v)
+                if self.tb:
+                    self.tb.add_scalar(f"train/{k}", float(v), step)
+
+    # --- call once per epoch with evaluation metrics ---
+    def log_epoch(self, step, epoch,
+                  main_auc_macro=None, main_auc_micro=None,
+                  per_label_auc=None, probe_age_auc=None, ece_macro=None):
+        row = {
+            "step": step, "epoch": epoch,
+            "main_loss": self.ema.get("main_loss"),
+            "age_loss": self.ema.get("age_loss"),
+            "total_loss": self.ema.get("total_loss"),
+            "lambda": self.ema.get("lambda"),
+            "adv_acc": self.ema.get("adv_acc"),
+            "main_auc_macro": self._to_float(main_auc_macro),
+            "main_auc_micro": self._to_float(main_auc_micro),
+            "probe_age_auc": self._to_float(probe_age_auc),
+            "ece_macro": self._to_float(ece_macro),
+        }
+
+        # TensorBoard scalars
+        if self.tb:
+            if main_auc_macro is not None: 
+                self.tb.add_scalar("eval/main_auc_macro", float(main_auc_macro), step)
+            if main_auc_micro is not None: 
+                self.tb.add_scalar("eval/main_auc_micro", float(main_auc_micro), step)
+            if probe_age_auc is not None: 
+                self.tb.add_scalar("eval/probe_age_auc", float(probe_age_auc), step)
+            if ece_macro is not None: 
+                self.tb.add_scalar("eval/ece_macro", float(ece_macro), step)
+
+        # Per-label AUCs
+        if per_label_auc is not None:
+            for i, auc in enumerate(per_label_auc):
+                key = f"auc_{i}_{self.per_label_names[i]}" if i < len(self.per_label_names) and self.per_label_names[i] else f"auc_{i}"
+                row[key] = self._to_float(auc)
+                if self.tb and auc is not None:
+                    self.tb.add_scalar(f"eval/per_label/{key}", float(auc), step)
+
+        # Write CSV row
+        with open(self.csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=self.csv_fields).writerow(row)
+
+    def close(self):
+        if self.tb: 
+            self.tb.close()
+
+    @staticmethod
+    def _to_float(x):
+        try:
+            return None if x is None else float(x)
+        except Exception:
+            return None
+
+# =============================================================================
+# ENHANCED CALLBACKS WITH COMPREHENSIVE LOGGING
+# =============================================================================
+
+class AdversarialLoggingCallback(Callback):
+    """Callback to log adversarial training metrics during training"""
+    def __init__(self, adv_logger):
+        super().__init__()
+        self.adv_logger = adv_logger
+        self.current_epoch = 0
+        self.global_step = 0
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Log step-level metrics during training"""
+        if hasattr(pl_module, 'current_lambda'):
+            # Extract metrics from the model if available
+            main_loss = outputs.get('train_loss', None) if isinstance(outputs, dict) else None
+            age_loss = outputs.get('train_age_adv', None) if isinstance(outputs, dict) else None
+            total_loss = outputs.get('train_total', None) if isinstance(outputs, dict) else None
+            current_lambda = pl_module.current_lambda
+            
+            # Calculate adversary accuracy if age logits are available
+            adv_acc = None
+            if hasattr(pl_module, 'last_age_logits') and hasattr(pl_module, 'last_age_targets'):
+                adv_acc = adversary_accuracy_from_logits(
+                    pl_module.last_age_logits, 
+                    pl_module.last_age_targets,
+                    mode=getattr(pl_module, 'age_mode', 'categorical')
+                )
+            
+            self.adv_logger.log_step(
+                step=self.global_step,
+                epoch=self.current_epoch,
+                main_loss=main_loss,
+                age_loss=age_loss,
+                total_loss=total_loss,
+                lambd=current_lambda,
+                adv_acc=adv_acc
+            )
+        
+        self.global_step += 1
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Log epoch-level evaluation metrics"""
+        self.current_epoch = trainer.current_epoch
+        
+        # Calculate evaluation metrics
+        # Note: These would need to be computed from validation/test data
+        # For now, we'll log what's available from the model
+        
+        # Get validation metrics if available
+        val_loss = trainer.callback_metrics.get('val_loss', None)
+        val_cls = trainer.callback_metrics.get('val_cls', None)
+        val_age_adv = trainer.callback_metrics.get('val_age_adv', None)
+        
+        # Log epoch metrics
+        self.adv_logger.log_epoch(
+            step=self.global_step,
+            epoch=self.current_epoch,
+            main_auc_macro=None,  # Would need to compute from validation data
+            main_auc_micro=None,  # Would need to compute from validation data
+            per_label_auc=None,   # Would need to compute from validation data
+            probe_age_auc=None,   # Would need to compute linear probe
+            ece_macro=None        # Would need to compute calibration error
+        )
 
 class TrainPredictionsAndEmbeddingsCallback(Callback):
-    def __init__(self, out_dir, model_class, num_classes, train_meta, target_cols):
+    def __init__(self, out_dir, model_class, num_classes, train_meta, target_cols, adv_logger=None):
         super().__init__()
         self.out_dir = out_dir
         self.model_class = model_class
@@ -26,6 +248,7 @@ class TrainPredictionsAndEmbeddingsCallback(Callback):
         self.train_meta = train_meta
         self.target_cols = target_cols
         self.original_head = None  # To store and restore the original head
+        self.adv_logger = adv_logger  # Enhanced logging
 
     def on_train_epoch_end(self, trainer, pl_module):
         device = pl_module.device
@@ -158,6 +381,14 @@ def main(args):
     # Setup TensorBoard logger
     tensorboard_logger = TensorBoardLogger(save_dir=log_dir, name=out_name)
     tensorboard_logger.log_hyperparams(cfg)
+    
+    # Initialize comprehensive adversarial logging system
+    adv_logger = AdvLogger(
+        log_dir=os.path.join(log_dir, "adv_logs"),
+        csv_name="train_log.csv",
+        per_label_names=[f"class_{i}" for i in range(cfg['num_classes_main'])]
+    )
+    adv_logger.set_tensorboard(tensorboard_logger)
 
     # Validate CSV files exist
     for csv_name, csv_path in [('train', cfg['train_csv']), ('val', cfg['val_csv']), ('test', cfg['test_csv'])]:
@@ -203,7 +434,12 @@ def main(args):
                 args.checkpoint_path,
                 num_classes=cfg['num_classes_main'],
                 num_age_groups=4,
-                adv_age_lambda=cfg.get('adv_age_lambda', 0.1)
+                adv_age_lambda=cfg.get('adv_age_lambda', 0.5),
+                use_scheduled_lambda=cfg.get('use_scheduled_lambda', True),
+                age_mode=cfg.get('age_mode', 'categorical'),
+                age_head_hidden=cfg.get('age_head_hidden', 256),
+                age_head_dropout=cfg.get('age_head_dropout', 0.2),
+                debias_enable=cfg.get('debias_enable', True)
             )
         else:
             model = model_class.load_from_checkpoint(
@@ -215,7 +451,12 @@ def main(args):
             model = model_class(
                 num_classes=cfg['num_classes_main'],
                 num_age_groups=4,
-                adv_age_lambda=cfg.get('adv_age_lambda', 0.1)
+                adv_age_lambda=cfg.get('adv_age_lambda', 0.5),
+                use_scheduled_lambda=cfg.get('use_scheduled_lambda', True),
+                age_mode=cfg.get('age_mode', 'categorical'),
+                age_head_hidden=cfg.get('age_head_hidden', 256),
+                age_head_dropout=cfg.get('age_head_dropout', 0.2),
+                debias_enable=cfg.get('debias_enable', True)
             )
         else:
             model = model_class(
@@ -233,7 +474,8 @@ def main(args):
         # Create callbacks list
         callbacks_list = [
             checkpoint_callback, 
-            frequent_checkpoint_callback
+            frequent_checkpoint_callback,
+            AdversarialLoggingCallback(adv_logger)  # Add adversarial logging
         ]
         
         # Add early stopping if enabled
@@ -252,7 +494,8 @@ def main(args):
             model_class=model_class,
             num_classes=cfg['num_classes_main'],
             train_meta=pd.read_csv(cfg['train_details_csv']),
-            target_cols=pd.Index([f'target_{i}' for i in range(cfg['num_classes_main'])])
+            target_cols=pd.Index([f'target_{i}' for i in range(cfg['num_classes_main'])]),
+            adv_logger=adv_logger
         )
         callbacks_list.append(train_pred_emb_callback)
 
@@ -269,7 +512,7 @@ def main(args):
             deterministic=False,  # Set to True if you want reproducible results
             # Add recovery options
             reload_dataloaders_every_n_epochs=0,  # Don't reload dataloaders
-            # Add gradient clipping to prevent training instability
+            # Add gradient clipping to prevent training instability (from instruction_adv.py)
             gradient_clip_val=1.0
         )
         

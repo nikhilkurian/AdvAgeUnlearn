@@ -1,0 +1,29 @@
+# Linear Probe Configuration for Age Group Analysis
+
+# Reference to main config for data paths
+main_config_path: "config.yaml"
+
+# Model checkpoint to use for embedding extraction
+checkpoint_path: "/home/4tb/mimic/files/mimic-cxr-jpg/codes/AdvRem/checkpoints/mimic_mdn_experiment_model_1_20250813_173013/epoch=12-val_loss=0.37.ckpt"
+
+# Linear probe settings
+linear_probe:
+  batch_size: 64
+  learning_rate: 0.001
+  max_epochs: 50
+  num_classes: 4  # age groups
+  
+# Output settings
+# These will be automatically set based on the checkpoint path
+output_dir: null  # Will be set automatically
+log_dir: null     # Will be set automatically
+results_file: "age_probe_results.txt"
+checkpoints_dir: null  # Will be set automatically
+embeddings_dir: null   # Will be set automatically
+
+# Age groups (should match main config)
+age_groups:
+  - [0, 36, "0-36"]
+  - [36, 50, "36-50"] 
+  - [50, 65, "50-65"]
+  - [65, -1, "65+"]

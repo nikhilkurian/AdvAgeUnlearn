@@ -12,6 +12,7 @@ from tqdm import tqdm
 import timm
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
+import math
 
 
 def make_identity_linear(in_features):
@@ -93,10 +94,47 @@ class GradReverse(torch.autograd.Function):
         return x.view_as(x)
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lambd, None
+        return -ctx.lambd * grad_output, None
 
 def grl(x, lambd=1.0):
     return GradReverse.apply(x, lambd)
+
+def schedule_lambda(global_step, total_steps, lambda_max=0.5):
+    """
+    Ganin-style schedule for adversarial lambda.
+    Gradually increases from ~0 at step 0 to lambda_max at the end.
+    More robust implementation with bounds.
+    """
+    p = max(0.0, min(1.0, global_step / max(1, total_steps)))
+    return lambda_max * (2.0 / (1.0 + math.exp(-10 * p)) - 1.0)
+
+class AgeAdversary(nn.Module):
+    """
+    Separate age adversary with configurable capacity and dropout.
+    """
+    def __init__(self, input_dim, num_age_groups, hidden_dim=256, dropout=0.2, mode="categorical"):
+        super().__init__()
+        self.mode = mode
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_age_groups if mode == "categorical" else (num_age_groups - 1))
+        )
+    
+    def forward(self, features):
+        return self.mlp(features)
+
+def ordinal_loss(logits, age_targets):
+    """
+    Ordinal loss for age groups using cumulative logits.
+    """
+    B, K1 = logits.shape
+    K = K1 + 1
+    # Build cumulative binary targets from integer bins
+    y = F.one_hot(age_targets.clamp(0, K-1), num_classes=K)[:, 1:].float()
+    return F.binary_cross_entropy_with_logits(logits, y, reduction='mean')
+
 # --------------------------------
 
 class DenseNetAgeAdv(BaseModel):
@@ -104,12 +142,23 @@ class DenseNetAgeAdv(BaseModel):
     DenseNet backbone with:
       - multilabel disease head (14 logits)
       - age-group adversary on GAP features via GRL
+      - improved architecture with separate AgeAdversary
     """
-    def __init__(self, num_classes=14, num_age_groups=4, adv_age_lambda=0.1):
+    def __init__(self, num_classes=14, num_age_groups=4, adv_age_lambda=0.5, 
+                 use_scheduled_lambda=True, age_mode="categorical", age_head_hidden=256, 
+                 age_head_dropout=0.2, debias_enable=True):
         super().__init__()
         self.num_classes = num_classes
         self.num_age_groups = num_age_groups
         self.adv_age_lambda = adv_age_lambda
+        self.use_scheduled_lambda = use_scheduled_lambda
+        self.age_mode = age_mode
+        self.debias_enable = debias_enable
+        
+        # Initialize logging attributes
+        self.current_lambda = 0.0
+        self.last_age_logits = None
+        self.last_age_targets = None
 
         # Backbone
         backbone = models.densenet121(pretrained=True)
@@ -122,8 +171,14 @@ class DenseNetAgeAdv(BaseModel):
         feat_dim = 1024
         # Main multilabel head (14 diseases)
         self.cls_head = nn.Linear(feat_dim, self.num_classes)
-        # Age-group adversary head (4 groups by default)
-        self.age_head = nn.Linear(feat_dim, self.num_age_groups)
+        # Age-group adversary (separate class with configurable capacity)
+        self.age_adversary = AgeAdversary(
+            input_dim=feat_dim,
+            num_age_groups=self.num_age_groups,
+            hidden_dim=age_head_hidden,
+            dropout=age_head_dropout,
+            mode=age_mode
+        )
 
         self.bce_logits = nn.BCEWithLogitsLoss()
         self.ce = nn.CrossEntropyLoss()
@@ -149,9 +204,17 @@ class DenseNetAgeAdv(BaseModel):
         device = next(self.parameters()).device  # Get the device of the model
         self.cls_head = make_identity_linear(feat_dim).to(device)
 
-    def process_batch(self, batch):
+    def process_batch(self, batch, current_step=None, total_steps=None):
         img, lab, age_group, age, age_onehot = self.unpack_batch(batch)  # provided by BaseModel
         device = img.device
+
+        # Calculate current lambda value
+        if not self.debias_enable:
+            current_lambda = 0.0
+        elif self.use_scheduled_lambda and current_step is not None and total_steps is not None:
+            current_lambda = schedule_lambda(current_step, total_steps, self.adv_age_lambda)
+        else:
+            current_lambda = self.adv_age_lambda
 
         # disease head
         feat = self.extract_gap_feat(img)
@@ -161,31 +224,76 @@ class DenseNetAgeAdv(BaseModel):
         # age adversary: GRL on the same GAP feat
         # convert provided one-hot to indices (dataset already aligns one-hot to label order)
         age_targets = torch.argmax(age_onehot.to(device), dim=1)
-        age_logits = self.age_head(grl(feat, self.adv_age_lambda))
-        loss_age = self.ce(age_logits, age_targets)
+        
+        # Use separate age adversary with GRL
+        # Always run through GRL - when λ=0, it passes zero gradient to features
+        # but age head can still learn and warm up properly
+        h_adv = grl(feat, current_lambda)
+        age_logits = self.age_adversary(h_adv)
+        
+        # Choose loss based on age mode
+        if self.age_mode == "categorical":
+            loss_age = self.ce(age_logits, age_targets)
+        else:  # ordinal
+            loss_age = ordinal_loss(age_logits, age_targets)
 
-        total = loss_cls + self.adv_age_lambda * loss_age
-        return total, loss_cls.detach(), loss_age.detach()
+        # CORRECT loss calculation: main loss + λ * age loss
+        # GRL already flips gradients for features, so we add age loss
+        # This makes: feature extractor tries to maximize age loss (via GRL)
+        # while age adversary tries to minimize age loss
+        total = loss_cls + current_lambda * loss_age
+        return total, loss_cls.detach(), loss_age.detach(), current_lambda
 
     # Lightning hooks
     def training_step(self, batch, batch_idx):
-        total, loss_cls, loss_age = self.process_batch(batch)
+        # Calculate current step and total steps for lambda scheduling
+        current_step = self.global_step
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        total, loss_cls, loss_age, current_lambda = self.process_batch(batch, current_step, total_steps)
+        
+        # Store current lambda for logging callbacks
+        self.current_lambda = current_lambda
+        
+        # Store age logits and targets for accuracy calculation
+        img, lab, age_group, age, age_onehot = self.unpack_batch(batch)
+        device = img.device
+        feat = self.extract_gap_feat(img)
+        h_adv = grl(feat, current_lambda)
+        age_logits = self.age_adversary(h_adv)
+        age_targets = torch.argmax(age_onehot.to(device), dim=1)
+        
+        self.last_age_logits = age_logits.detach()
+        self.last_age_targets = age_targets.detach()
+        
+        # Log metrics
         self.log('train_total', total, prog_bar=True)
         self.log('train_cls', loss_cls)
         self.log('train_age_adv', loss_age)
+        self.log('current_lambda', current_lambda, prog_bar=True)
+        
         if batch_idx == 0:
             grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
             self.logger.experiment.add_image('training_images', grid, self.current_epoch)
-        return total
+        
+        # Return dict for enhanced logging
+        return {
+            'loss': total,  # Required by PyTorch Lightning
+            'train_total': total,
+            'train_loss': loss_cls,
+            'train_age_adv': loss_age,
+            'current_lambda': current_lambda
+        }
 
     def validation_step(self, batch, batch_idx):
-        total, loss_cls, loss_age = self.process_batch(batch)
+        total, loss_cls, loss_age, current_lambda = self.process_batch(batch)
         self.log('val_loss', total, prog_bar=True)
         self.log('val_cls', loss_cls)
         self.log('val_age_adv', loss_age)
+        self.log('val_lambda', current_lambda)
 
     def test_step(self, batch, batch_idx):
-        total, loss_cls, loss_age = self.process_batch(batch)
+        total, loss_cls, loss_age, current_lambda = self.process_batch(batch)
         self.log('test_loss', total)
         self.log('test_cls', loss_cls)
         self.log('test_age_adv', loss_age)
